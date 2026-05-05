@@ -1,1 +1,134 @@
 
+{
+  "Comment": "YouTube Data Pipeline - Bronze → Silver → Gold",
+  "StartAt": "IngestFromYouTubeAPI",
+  "States": {
+
+    "IngestFromYouTubeAPI": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "arn:aws:lambda:us-east-1:043074500839:function:la-yt-pipeline-youtube-ingestion"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.TooManyRequestsException"],
+          "IntervalSeconds": 30,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "FailState"
+        }
+      ],
+      "Next": "WaitForS3"
+    },
+
+    "WaitForS3": {
+      "Type": "Wait",
+      "Seconds": 10,
+      "Next": "ParallelProcessing"
+    },
+
+    "ParallelProcessing": {
+      "Type": "Parallel",
+      "Branches": [
+
+        {
+          "StartAt": "TransformReferenceData",
+          "States": {
+            "TransformReferenceData": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "arn:aws:lambda:us-east-1:043074500839:function:la-data-pipeline-jsontoparquet-dev"
+              },
+              "End": true
+            }
+          }
+        },
+
+        {
+          "StartAt": "BronzeToSilver",
+          "States": {
+            "BronzeToSilver": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::glue:startJobRun.sync",
+              "Parameters": {
+                "JobName": "la-yt-data-pipeline-broze-to-silver",
+                "Arguments": {
+                  "--bronze_database": "la-yt-pipeline-bronze",
+                  "--bronze_table": "raw_statistics",
+                  "--silver_bucket": "la-yt-data-silver",
+                  "--silver_database": "la-yt-pipeline-silver",
+                  "--silver_table": "clean_statistics"
+                }
+              },
+              "End": true
+            }
+          }
+        }
+
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "FailState"
+        }
+      ],
+      "Next": "RunDataQualityChecks"
+    },
+
+    "RunDataQualityChecks": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "arn:aws:lambda:us-east-1:043074500839:function:la-yt-data-quality",
+        "Payload": {
+          "database": "la-yt-pipeline-silver",
+          "tables": ["clean_statistics", "clean_reference_data"]
+        }
+      },
+      "ResultPath": "$.dq_result",
+      "Next": "CheckDQ"
+    },
+
+    "CheckDQ": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.dq_result.Payload.quality_passed",
+          "BooleanEquals": true,
+          "Next": "SilverToGold"
+        }
+      ],
+      "Default": "FailState"
+    },
+
+    "SilverToGold": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Parameters": {
+        "JobName": "la-yt-data-pipeline-silver-to-gold",
+        "Arguments": {
+          "--silver_database": "la-yt-pipeline-silver",
+          "--gold_bucket": "la-yt-data-gold",
+          "--gold_database": "la-yt-pipeline-gold"
+        }
+      },
+      "Next": "SuccessState"
+    },
+
+    "SuccessState": {
+      "Type": "Succeed"
+    },
+
+    "FailState": {
+      "Type": "Fail"
+    }
+
+  }
+}
