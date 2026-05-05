@@ -1,1 +1,206 @@
 
+"""
+Lambda: Reference Data Transformation (Bronze → Silver Layer)
+------------------------------------------------------------
+
+This Lambda function is triggered automatically when new JSON reference data
+is uploaded to the Bronze S3 bucket (via S3 event notification).
+
+Its responsibility is to clean and transform raw reference data (video categories)
+into a structured, query-friendly format (Parquet) in the Silver layer.
+
+For each incoming file, the function:
+- Reads raw JSON data from S3
+- Extracts and normalizes category information
+- Validates and removes duplicate records
+- Adds ingestion metadata (timestamp, source file, region)
+- Writes the cleaned dataset to S3 in Parquet format
+- Updates the AWS Glue Data Catalog for querying
+
+Key improvements in this pipeline:
+- Handles inconsistent JSON structures safely
+- Ensures data quality through validation
+- Prevents duplicate records
+- Supports idempotent writes (overwrites per partition)
+- Provides structured logging and error alerting
+
+Environment Variables:
+    S3_BUCKET_SILVER      - Target S3 bucket for cleaned data
+    GLUE_DB_SILVER        - Glue database name
+    GLUE_TABLE_REFERENCE  - Glue table name
+    SNS_ALERT_TOPIC_ARN   - SNS topic for alerts (optional)
+"""
+
+import json
+import os
+import logging
+from datetime import datetime, timezone
+from urllib.parse import unquote_plus
+
+import boto3
+import awswrangler as wr
+import pandas as pd
+
+# ---------- Logging ----------
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+# ---------- Configuration ----------
+SILVER_BUCKET = os.environ["S3_BUCKET_SILVER"]
+GLUE_DB = os.environ.get("GLUE_DB_SILVER", "yt_pipeline_silver_dev")
+GLUE_TABLE = os.environ.get("GLUE_TABLE_REFERENCE", "clean_reference_data")
+SNS_TOPIC_ARN = os.environ.get("SNS_ALERT_TOPIC_ARN", "")
+
+SILVER_PATH = f"s3://{SILVER_BUCKET}/youtube/reference_data/"
+
+s3 = boto3.client("s3")
+sns = boto3.client("sns")
+
+
+# ---------- Read JSON ----------
+def read_json_from_s3(bucket, key):
+    """
+    Read raw JSON from S3.
+
+    Using boto3 instead of awswrangler because the JSON contains mixed structures
+    (top-level fields + nested arrays), which pandas cannot parse reliably.
+    """
+    response = s3.get_object(Bucket=bucket, Key=key)
+    content = response["Body"].read().decode("utf-8")
+    return json.loads(content)
+
+
+# ---------- Validation ----------
+def validate_category_data(df):
+    """
+    Validate and clean category data.
+    Removes duplicates and checks required structure.
+    """
+    if df.empty:
+        raise ValueError("No category data found (empty DataFrame)")
+
+    required_columns = {"id", "snippet.title"}
+    existing_columns = set(df.columns)
+    missing_columns = required_columns - existing_columns
+
+    if missing_columns:
+        logger.warning(f"Missing expected columns: {missing_columns}")
+
+    # Remove duplicate category IDs
+    initial_count = len(df)
+
+    if "id" in df.columns:
+        df = df.drop_duplicates(subset=["id"], keep="last")
+
+    final_count = len(df)
+
+    if initial_count != final_count:
+        logger.info(f"Removed {initial_count - final_count} duplicate records")
+
+    return df
+
+
+# ---------- Alerts ----------
+def notify_failure(subject, message):
+    """Send SNS alert if configured."""
+    if SNS_TOPIC_ARN:
+        sns.publish(
+            TopicArn=SNS_TOPIC_ARN,
+            Subject=subject[:100],
+            Message=message
+        )
+
+
+# ---------- Lambda Handler ----------
+def lambda_handler(event, context):
+    """
+    Main entry point.
+    Processes new S3 reference data files and writes cleaned output to Silver.
+    """
+
+    records = event.get("Records", [])
+
+    # Handle direct invocation (e.g., Step Functions)
+    if not records:
+        records = [event] if "s3" in event else []
+
+    processed = []
+    errors = []
+
+    for record in records:
+        try:
+            s3_info = record["s3"]
+            bucket = s3_info["bucket"]["name"]
+            key = unquote_plus(s3_info["object"]["key"])
+
+            logger.info(f"Processing file: s3://{bucket}/{key}")
+
+            # ----- Read JSON -----
+            raw_data = read_json_from_s3(bucket, key)
+
+            # Normalize JSON structure
+            if "items" in raw_data and isinstance(raw_data["items"], list):
+                df = pd.json_normalize(raw_data["items"])
+            else:
+                df = pd.json_normalize(raw_data)
+
+            logger.info(f"Raw data shape: {df.shape}")
+
+            # ----- Validate -----
+            df = validate_category_data(df)
+
+            # ----- Add Metadata -----
+            df["_ingestion_timestamp"] = datetime.now(timezone.utc).isoformat()
+            df["_source_file"] = key
+
+            # Extract region from S3 path
+            region = "unknown"
+            for part in key.split("/"):
+                if part.startswith("region="):
+                    region = part.split("=")[1]
+                    break
+
+            df["region"] = region
+
+            logger.info(f"Clean data shape: {df.shape} | Region: {region}")
+
+            # ----- Write to S3 (Parquet) -----
+            wr.s3.to_parquet(
+                df=df,
+                path=SILVER_PATH,
+                dataset=True,
+                database=GLUE_DB,
+                table=GLUE_TABLE,
+                partition_cols=["region"],
+                mode="overwrite_partitions",  # ensures idempotency
+                schema_evolution=True,
+            )
+
+            logger.info(f"Data written to Silver layer: {SILVER_PATH}")
+
+            processed.append({
+                "key": key,
+                "region": region,
+                "rows": len(df)
+            })
+
+        except Exception as e:
+            logger.error(f"Error processing file: {e}", exc_info=True)
+
+            errors.append({
+                "key": key if "key" in locals() else "unknown",
+                "error": str(e)
+            })
+
+    # ---------- Summary ----------
+    if errors:
+        notify_failure(
+            subject="YouTube Pipeline - Silver Layer Failure",
+            message=json.dumps(errors, indent=2)
+        )
+
+    return {
+        "statusCode": 200,
+        "processed": processed,
+        "errors": errors
+    }
