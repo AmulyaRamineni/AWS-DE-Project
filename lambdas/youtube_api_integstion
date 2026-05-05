@@ -1,1 +1,225 @@
 
+"""
+Lambda: YouTube Data Ingestion Pipeline (Bronze Layer)
+-----------------------------------------------------
+
+This Lambda function runs on a scheduled trigger (via EventBridge, e.g., every few hours).
+It collects trending YouTube video data across multiple regions using the YouTube Data API.
+
+For each configured region, the function:
+- Fetches trending video data (most popular videos)
+- Fetches video category metadata (reference data)
+- Stores the raw JSON responses into an S3 Bronze bucket
+
+The data is saved using a partitioned structure (region/date/hour) to support
+efficient querying and downstream processing.
+
+This replaces older manual workflows with a fully automated,
+near real-time ingestion pipeline.
+
+Environment Variables:
+    YOUTUBE_API_KEY       - API key for YouTube Data API v3
+    S3_BUCKET_BRONZE      - S3 bucket for storing raw data
+    YOUTUBE_REGIONS       - Comma-separated region codes (default included)
+    SNS_ALERT_TOPIC_ARN   - SNS topic ARN for failure alerts (optional)
+"""
+
+import json
+import os
+import logging
+from datetime import datetime, timezone
+from urllib.request import urlopen, Request
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
+
+import boto3
+
+# ---------- Logging ----------
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+# ---------- AWS Clients ----------
+s3 = boto3.client("s3")
+sns = boto3.client("sns")
+
+# ---------- Configuration ----------
+API_KEY = os.environ["YOUTUBE_API_KEY"]
+BUCKET_NAME = os.environ["S3_BUCKET_BRONZE"]
+REGION_LIST = os.environ.get(
+    "YOUTUBE_REGIONS",
+    "US,GB,CA,DE,FR,IN,JP,KR,MX,RU"
+).split(",")
+
+SNS_TOPIC_ARN = os.environ.get("SNS_ALERT_TOPIC_ARN", "")
+
+BASE_URL = "https://www.googleapis.com/youtube/v3"
+MAX_RESULTS = 50
+
+
+# ---------- API Functions ----------
+def get_trending_videos(region):
+    """Fetch trending (most popular) videos for a region."""
+    params = urlencode({
+        "part": "snippet,statistics,contentDetails",
+        "chart": "mostPopular",
+        "regionCode": region,
+        "maxResults": MAX_RESULTS,
+        "key": API_KEY
+    })
+
+    url = f"{BASE_URL}/videos?{params}"
+    request = Request(url, headers={"Accept": "application/json"})
+
+    with urlopen(request, timeout=30) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def get_video_categories(region):
+    """Fetch video category reference data for a region."""
+    params = urlencode({
+        "part": "snippet",
+        "regionCode": region,
+        "key": API_KEY
+    })
+
+    url = f"{BASE_URL}/videoCategories?{params}"
+    request = Request(url, headers={"Accept": "application/json"})
+
+    with urlopen(request, timeout=30) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+# ---------- S3 Upload ----------
+def upload_json_to_s3(data, bucket, key):
+    """Upload JSON data to S3 with metadata."""
+    payload = json.dumps(data, ensure_ascii=False, indent=2)
+
+    return s3.put_object(
+        Bucket=bucket,
+        Key=key,
+        Body=payload.encode("utf-8"),
+        ContentType="application/json",
+        Metadata={
+            "ingestion_timestamp": datetime.now(timezone.utc).isoformat(),
+            "source": "youtube_api"
+        }
+    )
+
+
+# ---------- Alerting ----------
+def notify_failure(subject, message):
+    """Send SNS alert if configured."""
+    if SNS_TOPIC_ARN:
+        sns.publish(
+            TopicArn=SNS_TOPIC_ARN,
+            Subject=subject[:100],
+            Message=message
+        )
+
+
+# ---------- Lambda Handler ----------
+def lambda_handler(event, context):
+
+    current_time = datetime.now(timezone.utc)
+    date_str = current_time.strftime("%Y-%m-%d")
+    hour_str = current_time.strftime("%H")
+    run_id = current_time.strftime("%Y%m%d_%H%M%S")
+
+    summary = {"success": [], "failed": []}
+
+    for region in REGION_LIST:
+        region = region.strip().lower()
+        logger.info(f"Processing region: {region}")
+
+        # ----- Fetch Trending Videos -----
+        try:
+            videos = get_trending_videos(region)
+            video_count = len(videos.get("items", []))
+
+            videos["_metadata"] = {
+                "run_id": run_id,
+                "region": region,
+                "timestamp": current_time.isoformat(),
+                "video_count": video_count
+            }
+
+            s3_key = (
+                f"youtube/raw_statistics/"
+                f"region={region}/"
+                f"date={date_str}/"
+                f"hour={hour_str}/"
+                f"{run_id}.json"
+            )
+
+            upload_json_to_s3(videos, BUCKET_NAME, s3_key)
+            logger.info(f"Uploaded {video_count} videos to S3")
+
+        except (HTTPError, URLError) as err:
+            logger.error(f"API error (videos) for {region}: {err}")
+            summary["failed"].append({
+                "region": region,
+                "step": "videos",
+                "error": str(err)
+            })
+            continue
+
+        except Exception as err:
+            logger.error(f"Unexpected error (videos) for {region}: {err}")
+            summary["failed"].append({
+                "region": region,
+                "step": "videos",
+                "error": str(err)
+            })
+            continue
+
+        # ----- Fetch Categories -----
+        try:
+            categories = get_video_categories(region)
+
+            categories["_metadata"] = {
+                "run_id": run_id,
+                "region": region,
+                "timestamp": current_time.isoformat()
+            }
+
+            category_key = (
+                f"youtube/raw_statistics_reference_data/"
+                f"region={region}/"
+                f"date={date_str}/"
+                f"{region}_categories.json"
+            )
+
+            upload_json_to_s3(categories, BUCKET_NAME, category_key)
+            logger.info("Uploaded category data")
+
+        except (HTTPError, URLError) as err:
+            logger.error(f"API error (categories) for {region}: {err}")
+            summary["failed"].append({
+                "region": region,
+                "step": "categories",
+                "error": str(err)
+            })
+            continue
+
+        summary["success"].append(region)
+
+    # ---------- Summary ----------
+    final_message = (
+        f"Ingestion {run_id} completed | "
+        f"Success: {len(summary['success'])}/{len(REGION_LIST)} | "
+        f"Failed: {len(summary['failed'])}"
+    )
+
+    logger.info(final_message)
+
+    if summary["failed"]:
+        notify_failure(
+            subject=f"YouTube Pipeline Alert - {run_id}",
+            message=json.dumps(summary, indent=2)
+        )
+
+    return {
+        "statusCode": 200,
+        "run_id": run_id,
+        "summary": summary
+    }
